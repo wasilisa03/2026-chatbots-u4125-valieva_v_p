@@ -1,0 +1,164 @@
+import os
+import logging
+import aiosqlite
+from datetime import datetime
+from dotenv import load_dotenv
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Request
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
+)
+
+# --- 1. НАСТРОЙКА ЛОГИНГА И ЗАГРУЗКА ТОКЕНА ---
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Загружаем переменные окружения из файла .env
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+# Проверка наличия токена (критически важный шаг)
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "BOT_TOKEN не задан. Создайте файл .env по примеру .env.example и вставьте туда токен."
+    )
+
+# --- 2. СОСТОЯНИЯ ДИАЛОГА ---
+WAITING_FIO, WAITING_IDEA = range(2)
+
+# --- 3. РАБОТА С БАЗОЙ ДАННЫХ (SQLite) ---
+async def init_db():
+    """Создает таблицу feedback, если ее нет."""
+    async with aiosqlite.connect("feedback.db") as db:
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fio TEXT NOT NULL,
+                idea TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        await db.commit()
+
+# --- 4. КОМАНДЫ ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /start и установка меню."""
+    await update.message.reply_text(
+        "Привет! Я бот для сбора обратной связи.\n\n"
+        "Используй команду /stats для просмотра статистики или кнопку 'Оставить отзыв'."
+    )
+    # Устанавливаем кнопки в меню (бот должен быть запущен, чтобы это сработало)
+    await context.bot.set_my_commands(
+        [
+            ("leave_feedback", "Оставить отзыв"),
+            ("stats", "Статистика"),
+        ]
+    )
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /stats - показывает количество отзывов."""
+    async with aiosqlite.connect("feedback.db") as db:
+        async with db.execute("SELECT COUNT(*) FROM feedback") as cursor:
+            count = (await cursor.fetchone())[0]
+    await update.message.reply_text(f"Количество отзывов: {count}")
+
+# --- 5. ДИАЛОГ ОСТАВЛЕНИЯ ОТЗЫВА ---
+async def leave_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало диалога."""
+    await update.message.reply_text("Привет! Прежде чем оставить отзыв, напиши своё ФИО")
+    return WAITING_FIO
+
+async def handle_fio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохраняем ФИО и просим идею."""
+    context.user_data["fio"] = update.message.text.strip()
+    await update.message.reply_text("Принято! Оставь рекомендации для улучшения")
+    return WAITING_IDEA
+
+async def handle_idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохраняем идею в БД и предлагаем продолжить."""
+    idea = update.message.text.strip()
+    fio = context.user_data.get("fio", "Не указано")
+    created_at = datetime.now().isoformat()
+
+    async with aiosqlite.connect("feedback.db") as db:
+        await db.execute(
+            "INSERT INTO feedback (fio, idea, created_at) VALUES (?, ?, ?)",
+            (fio, idea, created_at),
+        )
+        await db.commit()
+
+    # Кнопки после отправки отзыва
+    keyboard = InlineKeyboardMarkup.from_row([
+        InlineKeyboardButton("Добавить еще", callback_data="add_more"),
+        InlineKeyboardButton("Конец", callback_data="end"),
+    ])
+
+    await update.message.reply_text("Спасибо за отзыв!", reply_markup=keyboard)
+    return ConversationHandler.END
+
+# --- 6. ОБРАБОТКА КНОПОК ---
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Реакция на нажатие кнопок 'Добавить еще' и 'Конец'."""
+    query = update.callback_query
+    await query.answer() # Обязательно подтверждаем нажатие
+
+    if query.data == "add_more":
+        await query.edit_message_text(text="Напиши своё ФИО")
+        return WAITING_FIO
+
+    if query.data == "end":
+        await query.edit_message_text(text="Диалог завершён. Спасибо!")
+        return ConversationHandler.END
+
+# --- 7. ОТМЕНА ДИАЛОГА ---
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /cancel."""
+    await update.message.reply_text("Диалог отменён.")
+    return ConversationHandler.END
+
+# --- 8. ГЛАВНАЯ ФУНКЦИЯ ЗАПУСКА ---
+def main():
+    # Создаем объект Request с таймаутами для обхода ошибок сети на Windows
+    request = Request(
+        connect_timeout=60.0,
+        read_timeout=60.0,
+        write_timeout=60.0,
+    )
+    
+    # Билдер приложения с токеном и кастомным запросом
+    application = ApplicationBuilder().token(BOT_TOKEN).request(request).build()
+    
+    # Обработчики команд
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stats", stats))
+
+    # Обработчик диалога (Conversation)
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("leave_feedback", leave_feedback)],
+        states={
+            WAITING_FIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_fio)],
+            WAITING_IDEA: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_idea)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    
+    # Обработчик кнопок (Callback)
+    application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(handle_buttons))
+    
+    # Инициализация базы данных перед запуском
+    application.post_init = init_db 
+    
+    # Запуск бота (drop_pending_updates=True очищает очередь при перезапуске)
+    application.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
